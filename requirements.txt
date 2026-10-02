@@ -1,8 +1,12 @@
-fastapi
-uvicorn
-python-multipart
-streamlit
 anthropic
-opencv-python-headless
+fastapi
+joblib
 numpy
+openai
+opencv-python-headless
+python-multipart
 qrcode[pil]
+scikit-learn
+streamlit
+uvicorn
+xgboost

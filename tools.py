@@ -1,13 +1,35 @@
 """Tools the agent can call. Each returns a plain dict (JSON-safe)."""
+import os
 import re
 import uuid
 from urllib.parse import urlparse, parse_qs
 
 import cv2
 import numpy as np
+import requests
 
 from data import MERCHANTS, TRANSACTIONS, CASES, NOTIFICATIONS, PENDING_APPROVALS
-from policy import risk_score, risk_level
+from policy import risk_score, risk_level, evaluate_risk
+from qr_model import predict_qr_risk
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Zapier Webhook URLs (set as env vars). Each points at a Zap whose trigger
+# is "Webhooks by Zapier -> Catch Hook" and whose action is e.g. Gmail -> Send Email.
+ZAPIER_NOTIFY_URL = os.getenv("ZAPIER_NOTIFY_URL")   # merchant notification -> Gmail
+ZAPIER_CASE_URL = os.getenv("ZAPIER_CASE_URL")       # fraud case -> Gmail / Sheet
+
+
+def _send_to_zapier(url: str | None, payload: dict) -> bool:
+    if not url:
+        return False
+    try:
+        requests.post(url, json=payload, timeout=5)
+        return True
+    except requests.RequestException:
+        return False
 
 
 def get_transaction(txn_id: str) -> dict:
@@ -36,7 +58,8 @@ def decode_qr_upi_id(image_bytes: bytes) -> str | None:
 
 def verify_qr(merchant_id: str, image_bytes: bytes | None = None,
               txn_id: str | None = None) -> dict:
-    """Compare the QR photo (and the txn destination) with the registered UPI ID."""
+    """Compare the QR photo (and the txn destination) with the registered UPI ID,
+    plus score the QR image itself with the trained XGBoost model, if loaded."""
     m = MERCHANTS.get(merchant_id)
     if not m:
         return {"error": "merchant not found"}
@@ -49,21 +72,45 @@ def verify_qr(merchant_id: str, image_bytes: bytes | None = None,
     txn_mismatch = bool(txn) and txn["paid_to_upi"] != registered
     not_received = bool(txn) and not txn["merchant_received"]
 
-    score = risk_score(qr_mismatch, txn_mismatch, not_received)
+    ml_result = predict_qr_risk(image_bytes) if image_bytes else {"ml_available": False}
+    ml_probability = ml_result.get("ml_malicious_probability")
+
+    eval_result = evaluate_risk(
+        qr_mismatch=qr_mismatch,
+        txn_mismatch=txn_mismatch,
+        merchant_not_received=not_received,
+        ml_malicious_probability=ml_probability,
+        ml_flag=ml_result.get("ml_flag"),
+        detected_qr_upi=detected,
+        registered_upi=registered,
+        txn_paid_to=txn["paid_to_upi"] if txn else None,
+    )
+
     return {
         "registered_upi": registered,
         "detected_qr_upi": detected,
         "qr_mismatch": qr_mismatch,
         "txn_paid_to": txn["paid_to_upi"] if txn else None,
         "txn_destination_mismatch": txn_mismatch,
-        "risk_score": score,
-        "risk_level": risk_level(score),
+        **ml_result,
+        "risk_score": eval_result["risk_score"],
+        "risk_level": eval_result["risk_level"],
+        "action": eval_result["action"],
+        "pillars": eval_result["pillars"],
+        "triggered_factors": eval_result["triggered_factors"],
     }
 
 
 def notify_merchant(merchant_id: str, message: str) -> dict:
-    NOTIFICATIONS.append({"merchant_id": merchant_id, "message": message})
-    return {"status": "sent"}
+    record = {"merchant_id": merchant_id, "message": message}
+    NOTIFICATIONS.append(record)
+    url = os.getenv("ZAPIER_NOTIFY_URL") or ZAPIER_NOTIFY_URL
+    sent_via_zapier = _send_to_zapier(url, {
+        "subject": f"Paytm Sentinel alert — merchant {merchant_id}",
+        "message": message,
+        "merchant_id": merchant_id,
+    })
+    return {"status": "sent", "via_zapier": sent_via_zapier}
 
 
 def create_fraud_case(merchant_id: str, txn_id: str, risk_level: str, summary: str) -> dict:
@@ -71,6 +118,12 @@ def create_fraud_case(merchant_id: str, txn_id: str, risk_level: str, summary: s
             "txn_id": txn_id, "risk_level": risk_level, "summary": summary,
             "status": "OPEN"}
     CASES.append(case)
+    url = os.getenv("ZAPIER_CASE_URL") or ZAPIER_CASE_URL or os.getenv("ZAPIER_NOTIFY_URL") or ZAPIER_NOTIFY_URL
+    case["via_zapier"] = _send_to_zapier(url, {
+        "subject": f"[{risk_level}] Fraud case {case['case_id']} — {merchant_id}",
+        "case_id": case["case_id"], "merchant_id": merchant_id, "txn_id": txn_id,
+        "risk_level": risk_level, "summary": summary,
+    })
     return case
 
 
